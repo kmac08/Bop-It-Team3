@@ -1,0 +1,140 @@
+# Constants & Globals 
+SET MAX_TIME    TO 5
+SET NUM_ACTIONS TO 3   // 1 = accelerometer, 2 = button, 3 = joystick
+
+
+setup()
+{
+    SET score    TO 0
+    SET time     TO MAX_TIME
+    SET gameOver TO true
+
+    initializePins()
+    initializeDisplay()
+    initializeSound()
+}
+
+loop()
+{
+    gameOver = startNewGameButton()
+    time=MAX_TIME
+    score=0
+    
+    WHILE gameOver is false
+
+        SET currentAction TO generateRandom(1, NUM_ACTIONS)
+
+        IF currentAction == 1 THEN
+            playSound(ACCELEROMETER_PROMPT)
+            SET result TO checkAccelerometer()
+
+        ELSE IF currentAction == 2 THEN
+            playSound(BUTTON_PROMPT)
+            SET result TO checkPushButton()
+
+        ELSE IF currentAction == 3 THEN
+            playSound(JOYSTICK_PROMPT)
+            SET result TO checkJoystick()
+
+        END IF
+
+        IF result == CORRECT THEN
+            INCREMENT score BY 1
+            IF SCORE == 99 THEN
+                playSound(WIN)
+                update_display_Score(score)
+                gameOver=true
+            ELSE
+                playSound(SUCCESS)
+                update_display_Score(score)
+
+
+
+        ELSE IF result == TIMEOUT OR result == INCORRECT THEN
+            SET gameOver TO true
+            playSound(LOSE)
+            update_display_Score(score)
+
+        END IF
+
+    END WHILE
+}
+
+startNewGameButton()
+{
+        WHILE true
+            READ NewGameButton input
+
+            IF input matches expected gesture THEN
+                RETURN false
+            END IF
+    END WHILE
+
+    RETURN false
+
+}
+
+checkAccelerometer()
+{
+    WHILE time > 0
+        decreaseTime()
+        READ accelerometer input
+
+        IF input matches expected gesture THEN
+            RETURN CORRECT
+        END IF
+    END WHILE
+
+    RETURN TIMEOUT
+}
+
+checkPushButton()
+{
+    WHILE time > 0
+        decreaseTime()
+        READ button state
+
+        IF button is pressed THEN
+            RETURN CORRECT
+        END IF
+    END WHILE
+
+    RETURN TIMEOUT
+}
+
+checkJoystick()
+{
+    WHILE time > 0
+        decreaseTime()
+        READ joystick direction
+
+        IF direction matches expected direction THEN
+            RETURN CORRECT
+        END IF
+    END WHILE
+
+    RETURN TIMEOUT
+}
+
+decreaseTime()
+{
+    SET time TO time - 1
+    update_display_Time(time)
+}
+
+update_display_Score(score)
+{
+    DISPLAY score on screen/LEDs
+}
+
+
+
+playSound(type)
+{
+    IF type == SUCCESS              THEN play SUCCESS audio
+    IF type == WIN            THEN play WIN audio
+    IF type == LOSE                 THEN play lose audio
+    IF type == ACCELEROMETER_PROMPT THEN play accelerometer audio
+    IF type == BUTTON_PROMPT        THEN play button audio
+    IF type == JOYSTICK_PROMPT      THEN play joystick audio
+}
