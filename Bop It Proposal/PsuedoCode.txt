@@ -1,140 +1,176 @@
-# Constants & Globals 
-SET MAX_TIME    TO 5
-SET NUM_ACTIONS TO 3   // 1 = accelerometer, 2 = button, 3 = joystick
-
+# Constants & Globals
+SET MAX_TIME         TO 5
+SET NUM_ACTIONS      TO 3
+SET LED_DURATION     
+SET MOVEMENT_THRESHOLD 
 
 setup()
 {
     SET score    TO 0
     SET time     TO MAX_TIME
     SET gameOver TO true
-
     initializePins()
     initializeDisplay()
     initializeSound()
+    SET greenLED TO LOW
+    SET redLED   TO LOW
 }
 
 loop()
 {
-    gameOver = startNewGameButton()
-    time=MAX_TIME
-    score=0
-    
-    WHILE gameOver is false
+    WHILE true
+        waitForNewGame()
+        SET score    TO 0
+        SET time     TO MAX_TIME
+        SET greenLED TO LOW
+        SET redLED   TO LOW
+        update_display_Score(score)
 
-        SET currentAction TO generateRandom(1, NUM_ACTIONS)
+        SET gameOver TO false
+        WHILE gameOver is false
+            SET currentAction TO generateRandom(1, NUM_ACTIONS)
 
-        IF currentAction == 1 THEN
-            playSound(ACCELEROMETER_PROMPT)
-            SET result TO checkAccelerometer()
+            IF currentAction == 1 THEN
+                playSound(ACCELEROMETER_PROMPT)
+                SET result TO checkAccelerometer()
+            ELSE IF currentAction == 2 THEN
+                playSound(BUTTON_PROMPT)
+                SET result TO checkPushButton()
+            ELSE IF currentAction == 3 THEN
+                playSound(JOYSTICK_PROMPT)
+                SET result TO checkJoystick()
+            END IF
 
-        ELSE IF currentAction == 2 THEN
-            playSound(BUTTON_PROMPT)
-            SET result TO checkPushButton()
-
-        ELSE IF currentAction == 3 THEN
-            playSound(JOYSTICK_PROMPT)
-            SET result TO checkJoystick()
-
-        END IF
-
-        IF result == CORRECT THEN
-            INCREMENT score BY 1
-            IF SCORE == 99 THEN
-                playSound(WIN)
+            IF result == CORRECT THEN
+                INCREMENT score BY 1
+                lightLED(GREEN)
+                IF score == 99 THEN
+                    playSound(WIN)
+                    update_display_Score(score)
+                    SET gameOver TO true
+                ELSE
+                    playSound(SUCCESS)
+                    update_display_Score(score)
+                END IF
+            ELSE IF result == TIMEOUT OR result == INCORRECT THEN
+                lightLED(RED)
+                playSound(LOSE)
                 update_display_Score(score)
-                gameOver=true
-            ELSE
-                playSound(SUCCESS)
-                update_display_Score(score)
-
-
-
-        ELSE IF result == TIMEOUT OR result == INCORRECT THEN
-            SET gameOver TO true
-            playSound(LOSE)
-            update_display_Score(score)
-
-        END IF
-
+                SET gameOver TO true
+            END IF
+        END WHILE
     END WHILE
 }
 
-startNewGameButton()
+waitForNewGame()
 {
-        WHILE true
-            READ NewGameButton input
-
-            IF input matches expected gesture THEN
-                RETURN false
-            END IF
+    SET greenLED TO LOW
+    SET redLED   TO LOW
+    WHILE true
+        READ newGameButton state
+        IF newGameButton is pressed THEN
+            RETURN
+        END IF
     END WHILE
-
-    RETURN false
-
 }
 
 checkAccelerometer()
 {
+    SET time TO MAX_TIME
     WHILE time > 0
         decreaseTime()
-        READ accelerometer input
+        READ accelerometer magnitude
+        READ button state
+        READ joystick direction
 
-        IF input matches expected gesture THEN
+        IF accelerometer magnitude > MOVEMENT_THRESHOLD THEN
             RETURN CORRECT
+        ELSE IF button is pressed OR joystick moved THEN
+            RETURN INCORRECT
         END IF
     END WHILE
-
-    RETURN TIMEOUT
+    RETURN INCORRECT
 }
 
 checkPushButton()
 {
+    SET time TO MAX_TIME
     WHILE time > 0
         decreaseTime()
         READ button state
+        READ accelerometer magnitude
+        READ joystick direction
 
         IF button is pressed THEN
             RETURN CORRECT
+        ELSE IF accelerometer magnitude > MOVEMENT_THRESHOLD OR joystick moved THEN
+            RETURN INCORRECT
         END IF
     END WHILE
-
-    RETURN TIMEOUT
+    RETURN INCORRECT
 }
 
 checkJoystick()
 {
+    SET time TO MAX_TIME
     WHILE time > 0
         decreaseTime()
         READ joystick direction
+        READ button state
+        READ accelerometer magnitude
 
-        IF direction matches expected direction THEN
+        IF joystick moved in ANY direction THEN
             RETURN CORRECT
+        ELSE IF button is pressed OR accelerometer magnitude > MOVEMENT_THRESHOLD THEN
+            RETURN INCORRECT
         END IF
     END WHILE
-
-    RETURN TIMEOUT
+    RETURN INCORRECT
 }
 
 decreaseTime()
 {
-    SET time TO time - 1
-    update_display_Time(time)
+    SET time TO time - time_decrement #haven't decided timing decrement yet           
+}
+
+lightLED(color)
+{
+    IF color == GREEN THEN
+        SET greenLED TO HIGH
+        WAIT LED_DURATION
+        SET greenLED TO LOW
+    ELSE IF color == RED THEN
+        SET redLED TO HIGH
+    END IF
 }
 
 update_display_Score(score)
 {
-    DISPLAY score on screen/LEDs
+    DISPLAY score on screen
 }
-
 
 
 playSound(type)
 {
-    IF type == SUCCESS              THEN play SUCCESS audio
-    IF type == WIN            THEN play WIN audio
+    IF type == SUCCESS              THEN play success audio
+    IF type == WIN                  THEN play win audio
     IF type == LOSE                 THEN play lose audio
-    IF type == ACCELEROMETER_PROMPT THEN play accelerometer audio
-    IF type == BUTTON_PROMPT        THEN play button audio
-    IF type == JOYSTICK_PROMPT      THEN play joystick audio
+    IF type == ACCELEROMETER_PROMPT THEN play accelerometer prompt audio
+    IF type == BUTTON_PROMPT        THEN play button prompt audio
+    IF type == JOYSTICK_PROMPT      THEN play joystick prompt audio
+}
+
+initializePins()
+{
+    SET pins to i/o and initial states
+}
+
+initializeDisplay()
+{
+    clear screen and set it up
+}
+
+initializeSound()
+{
+    initialize speaker and load or map sound types
 }
