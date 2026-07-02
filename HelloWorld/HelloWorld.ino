@@ -1,4 +1,5 @@
 //Kirk McCann
+//Adam Hartman
 
 void setup() {
   pinMode(A5, OUTPUT);
