@@ -1,5 +1,5 @@
 //Kirk McCann
-
+// Fangchun Li comment for Assignment15.
 void setup() {
   pinMode(A5, OUTPUT);
   pinMode(A4, OUTPUT);
