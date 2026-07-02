@@ -1,4 +1,6 @@
 //Kirk McCann
+// Fangchun Li comment for Assignment15.
+//Adam Hartman
 
 void setup() {
   pinMode(A5, OUTPUT);
