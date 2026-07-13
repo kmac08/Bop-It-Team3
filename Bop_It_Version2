@@ -1,0 +1,462 @@
+#include <SPI.h>
+#include <Wire.h>
+#include <EEPROM.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h> 
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <DFRobotDFPlayerMini.h>
+
+#define USBSerial Serial
+#define EEPROM_SIZE 4  
+
+// --- SCREEN LAYOUT ORIENTATION METRICS ---
+#define SCREEN_W 320
+#define SCREEN_H 240
+
+// --- PINOUTS ---
+#define TFT_SCL   12
+#define TFT_SDA   11
+#define TFT_CS    10
+#define TFT_DC    14
+#define TFT_RST   21
+#define TFT_BL    15
+
+#define MPU_SDA   8
+#define MPU_SCL   9
+
+#define BTN_START 4
+#define BTN_PUSH  5
+
+#define LED_GREEN 7   
+#define LED_RED   16  
+
+#define JOY_X     1
+#define JOY_Y     2
+
+// DFPlayer Hardware Serial Routing
+#define DF_RX     18 // Connect to DFPlayer TX
+#define DF_TX     17 // Connect to DFPlayer RX
+
+// --- COLOR SELECTION PALETTE ---
+#define MARIO_SKY       0x5DFF  
+#define MARIO_RED       0xD000  
+#define MARIO_COIN      0xFDE0  
+#define MARIO_BRICK     0xB264  
+#define MARIO_WHITE     0xFFFF
+#define MARIO_BLACK     0x0000
+#define MARIO_OVERALLS  0x0010 
+#define KOOPA_GREEN     0x07E0  
+
+// --- AUDIO TRACK INDEXES ---
+#define SFX_PUSH   1  // 0001.mp3
+#define SFX_FLICK  2  // 0002.mp3
+#define SFX_SHAKE  3  // 0003.mp3
+
+enum GameState { STATE_MENU, STATE_NEW_ACTION, STATE_WAIT_INPUT, STATE_SUCCESS_ANIM, STATE_GAME_OVER };
+GameState currentState = STATE_MENU;
+
+enum ActionType { ACTION_PUSH, ACTION_FLICK, ACTION_SHAKE, ACTION_COUNT };
+ActionType currentAction;
+
+int currentScore = 0;
+int highScore = 0;
+const int maxScore = 100;
+
+unsigned long actionStartTime = 0;
+unsigned long actionDuration = 4000; 
+const unsigned long minDuration = 700;  
+
+int joyXCenter = 2048;
+int joyYCenter = 2048;
+const int deadzoneThreshold = 1400; 
+
+float lastAccX = 0, lastAccY = 0, lastAccZ = 9.8;
+const float shakeThreshold = 10.0; 
+
+unsigned long animTimer = 0;
+bool animFrame = false;
+unsigned long actionWindowDelay = 0;
+const unsigned long cooldownDuration = 400; 
+
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_MPU6050 mpu;
+DFRobotDFPlayerMini dfPlayer;
+
+void setup() {
+  USBSerial.begin(115200);
+
+  // Initialize DFPlayer Hardware Serial Bus on UART2
+  Serial2.begin(9600, SERIAL_8N1, DF_RX, DF_TX);
+
+  if (!EEPROM.begin(EEPROM_SIZE)) {
+    USBSerial.println("Failed to initialize EEPROM memory map");
+  } else {
+    highScore = EEPROM.read(0);
+    if (highScore > 100) highScore = 0; 
+  }
+
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_RED, LOW);
+
+  pinMode(BTN_START, INPUT_PULLUP);
+  pinMode(BTN_PUSH, INPUT);         
+  analogSetAttenuation(ADC_11db);
+
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+
+  SPI.begin(TFT_SCL, -1, TFT_SDA, TFT_CS);
+  tft.init(240, 320); 
+  tft.setRotation(1); 
+  
+  // Initialize I2C Bus with a 50ms hardware timeout safety net
+  Wire.begin(MPU_SDA, MPU_SCL);
+  Wire.setTimeOut(50); 
+  
+  if (mpu.begin()) {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  USBSerial.println("Initializing DFPlayer Mini...");
+  // ACK tracking disabled to prevent software hanging loops
+  if (!dfPlayer.begin(Serial2, false, false)) {
+    USBSerial.println("Warning: DFPlayer did not respond. Running in mute mode.");
+  } else {
+    delay(100);
+    dfPlayer.volume(25); // Set playback volume (0 to 30)
+    delay(100);
+  }
+
+  delay(300);
+  joyXCenter = analogRead(JOY_X);
+  joyYCenter = analogRead(JOY_Y);
+  
+  randomSeed(analogRead(3)); 
+  drawGameItHome();
+}
+
+void loop() {
+  switch (currentState) {
+    
+    case STATE_MENU: {
+      digitalWrite(LED_GREEN, (millis() / 400) % 2); 
+      if (digitalRead(BTN_START) == LOW) {
+        delay(50);
+        while(digitalRead(BTN_START) == LOW);
+        digitalWrite(LED_GREEN, LOW);
+        currentScore = 0;
+        currentState = STATE_NEW_ACTION;
+      }
+      break;
+    }
+
+    case STATE_NEW_ACTION: {
+      currentAction = (ActionType)random(0, ACTION_COUNT);
+      actionStartTime = millis();
+      actionWindowDelay = millis(); 
+
+      actionDuration = 4000 - (currentScore * 45); 
+      if (actionDuration < minDuration) actionDuration = minDuration;
+
+      drawActionScreen();
+      
+      // Cut off the last playing audio track instantly like an arcade unit
+      dfPlayer.stop(); 
+      delay(10); // Quick buffer clear threshold delay
+      
+      // Fire next instruction sequence track instantly
+      if (currentAction == ACTION_PUSH)       dfPlayer.play(SFX_PUSH);
+      else if (currentAction == ACTION_FLICK)  dfPlayer.play(SFX_FLICK);
+      else if (currentAction == ACTION_SHAKE)  dfPlayer.play(SFX_SHAKE);
+
+      currentState = STATE_WAIT_INPUT;
+      break;
+    }
+
+    case STATE_WAIT_INPUT: {
+      updateTimerBar();
+      animateActionGraphics();
+
+      if (millis() - actionStartTime >= actionDuration) {
+        handleLossTrigger("TIME OUT!");
+        break;
+      }
+
+      int inputStatus = processInputMatrix(); 
+      if (inputStatus == 1) { 
+        currentState = STATE_SUCCESS_ANIM;
+        animTimer = millis();
+        digitalWrite(LED_GREEN, HIGH);
+        drawSuccessSplash();
+      } 
+      else if (inputStatus == -1) {
+        handleLossTrigger("WRONG MOVE!");
+      }
+      break;
+    }
+
+    case STATE_SUCCESS_ANIM: {
+      if (millis() - animTimer >= 450) {
+        digitalWrite(LED_GREEN, LOW);
+        currentScore++;
+        if (currentScore >= maxScore) {
+          handleVictory();
+        } else {
+          currentState = STATE_NEW_ACTION;
+        }
+      }
+      break;
+    }
+
+    case STATE_GAME_OVER: {
+      digitalWrite(LED_RED, HIGH);
+      if (digitalRead(BTN_START) == LOW) {
+        delay(50);
+        while(digitalRead(BTN_START) == LOW);
+        digitalWrite(LED_RED, LOW);
+        drawGameItHome();
+        currentState = STATE_MENU;
+      }
+      break;
+    }
+  }
+}
+
+int processInputMatrix() {
+  int rX = analogRead(JOY_X);
+  int rY = analogRead(JOY_Y);
+  
+  bool isFlicking = (abs(rX - joyXCenter) > deadzoneThreshold || abs(rY - joyYCenter) > deadzoneThreshold);
+  bool isPushing = (digitalRead(BTN_PUSH) == HIGH); 
+
+  bool isShaking = false;
+  sensors_event_t a, g, temp;
+  if(mpu.getEvent(&a, &g, &temp)) {
+    float jerkX = abs(a.acceleration.x - lastAccX);
+    float jerkY = abs(a.acceleration.y - lastAccY);
+    lastAccX = a.acceleration.x; lastAccY = a.acceleration.y;
+    if (jerkX > shakeThreshold || jerkY > shakeThreshold) isShaking = true;
+  }
+
+  if (millis() - actionWindowDelay < cooldownDuration) {
+    return 0; 
+  }
+
+  if (currentAction == ACTION_PUSH) {
+    if (isPushing) return 1; 
+    if (isFlicking || isShaking) return -1;  
+  }
+  else if (currentAction == ACTION_FLICK) {
+    if (isFlicking) return 1;
+    if (isPushing || isShaking) return -1; 
+  }
+  else if (currentAction == ACTION_SHAKE) {
+    if (isShaking) return 1;
+    if (isPushing || isFlicking) return -1;
+  }
+
+  return 0; 
+}
+
+// --- SPRITE DESIGN ENGINE ---
+
+void drawMarioSprite(int x, int y, bool isJumping) {
+  int jOffset = isJumping ? -15 : 0;
+  
+  tft.fillRect(x + 12, y + jOffset + 0, 24, 6, MARIO_RED);
+  tft.fillRect(x + 18, y + jOffset + 6, 12, 6, MARIO_RED);
+  tft.fillRect(x + 18, y + jOffset + 12, 18, 12, 0xFDCB); 
+  tft.fillRect(x + 30, y + jOffset + 18, 6, 6, MARIO_BLACK); 
+  tft.fillRect(x + 12, y + jOffset + 24, 24, 18, MARIO_OVERALLS);
+  tft.fillRect(x + 6, y + jOffset + 30, 6, 12, MARIO_RED);   
+  tft.fillRect(x + 36, y + jOffset + 30, 6, 12, MARIO_RED);
+  tft.fillRect(x + 18, y + jOffset + 30, 4, 4, MARIO_COIN);
+  tft.fillRect(x + 26, y + jOffset + 30, 4, 4, MARIO_COIN);
+  if(!isJumping) {
+    tft.fillRect(x + 12, y + 42, 8, 6, MARIO_BRICK);
+    tft.fillRect(x + 28, y + 42, 8, 6, MARIO_BRICK);
+  } else {
+    tft.fillRect(x + 6, y + jOffset + 42, 8, 6, MARIO_BRICK);
+    tft.fillRect(x + 32, y + jOffset + 42, 8, 6, MARIO_BRICK);
+  }
+}
+
+void drawQuestionBlock(int x, int y, bool isHit) {
+  uint16_t blockColor = isHit ? MARIO_BRICK : MARIO_COIN;
+  tft.fillRect(x, y, 40, 40, blockColor);
+  tft.drawRect(x, y, 40, 40, MARIO_BLACK);
+  
+  if(!isHit) {
+    tft.setTextColor(MARIO_BLACK);
+    tft.setTextSize(3);
+    tft.setCursor(x + 13, y + 10);
+    tft.print("?");
+    tft.fillRect(x+2, y+2, 3, 3, MARIO_BLACK);
+    tft.fillRect(x+35, y+2, 3, 3, MARIO_BLACK);
+    tft.fillRect(x+2, y+35, 3, 3, MARIO_BLACK);
+    tft.fillRect(x+35, y+35, 3, 3, MARIO_BLACK);
+  }
+}
+
+void drawKoopaShell(int x, int y) {
+  tft.fillRoundRect(x + 4, y, 32, 28, 8, KOOPA_GREEN);
+  tft.drawRoundRect(x + 4, y, 32, 28, 8, MARIO_BLACK);
+  tft.fillRect(x + 4, y + 20, 32, 6, MARIO_WHITE);
+  tft.drawRect(x + 4, y + 20, 32, 6, MARIO_BLACK);
+  tft.fillRect(x + 14, y + 4, 2, 16, MARIO_BLACK);
+  tft.fillRect(x + 24, y + 4, 2, 16, MARIO_BLACK);
+}
+
+void drawGameItHome() {
+  tft.fillScreen(MARIO_SKY);
+  
+  tft.fillRect(0, SCREEN_H - 35, SCREEN_W, 35, MARIO_BRICK);
+  tft.fillRect(0, SCREEN_H - 35, SCREEN_W, 4, MARIO_BLACK);
+
+  tft.drawRect(12, 12, SCREEN_W - 24, SCREEN_H - 56, MARIO_BLACK);
+  tft.drawRect(14, 14, SCREEN_W - 28, SCREEN_H - 60, MARIO_WHITE);
+
+  tft.setTextColor(MARIO_RED);
+  tft.setTextSize(5);
+  tft.setCursor(55, 35); 
+  tft.print("GAME-IT!");
+
+  drawMarioSprite(30, 115, false);       
+  drawQuestionBlock(250, 120, false);   
+
+  int cardX = (SCREEN_W - 150) / 2; 
+  tft.fillRect(cardX, 105, 150, 26, MARIO_BLACK);
+  tft.drawRect(cardX, 105, 150, 26, MARIO_COIN);
+  tft.setTextColor(MARIO_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(cardX + 12, 114);
+  tft.print("HIGH SCORE: ");
+  tft.setTextSize(2);
+  tft.setTextColor(MARIO_COIN);
+  tft.print(highScore);
+
+  tft.fillCircle(105, 175, 8, MARIO_COIN);
+  tft.drawCircle(105, 175, 8, MARIO_BLACK);
+  tft.setTextColor(MARIO_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(125, 167);
+  tft.print("TAP START");
+}
+
+void drawActionScreen() {
+  tft.fillScreen(MARIO_SKY);
+  
+  tft.fillRect(0, 0, SCREEN_W, 45, MARIO_BLACK);
+  tft.setTextColor(MARIO_COIN);
+  tft.setTextSize(2);
+  tft.setCursor(20, 15);
+  tft.print("SCORE: ");  tft.print(currentScore);
+  
+  tft.setCursor(150, 15);
+  tft.print("HIGH SCORE: "); tft.print(highScore);
+
+  tft.setTextColor(MARIO_BLACK);
+  tft.setTextSize(4);
+  
+  switch (currentAction) {
+    case ACTION_PUSH:  tft.setCursor(75, 65); tft.print("PUSH IT!"); break;
+    case ACTION_FLICK: tft.setCursor(65, 65); tft.print("FLICK IT!"); break;
+    case ACTION_SHAKE: tft.setCursor(65, 65); tft.print("SHAKE IT!"); break;
+  }
+}
+
+void animateActionGraphics() {
+  if (millis() - animTimer >= 160) { 
+    animTimer = millis();
+    animFrame = !animFrame;
+
+    tft.fillRect(20, 110, 280, 85, MARIO_SKY);
+
+    if (currentAction == ACTION_PUSH) {
+      drawMarioSprite(135, 145, animFrame);
+      drawQuestionBlock(141, animFrame ? 92 : 105, animFrame);
+    } 
+    else if (currentAction == ACTION_FLICK) {
+      drawMarioSprite(50, 145, false); 
+      int shellX = animFrame ? 110 : 220; 
+      drawKoopaShell(shellX, 160);
+      
+      if(animFrame) {
+        tft.fillRect(160, 172, 25, 2, MARIO_RED);
+        tft.fillRect(195, 172, 15, 2, MARIO_RED);
+      } else {
+        tft.fillRect(115, 172, 35, 2, MARIO_RED);
+        tft.fillRect(165, 172, 20, 2, MARIO_RED);
+      }
+    } 
+    else if (currentAction == ACTION_SHAKE) {
+      int offset = animFrame ? -12 : 12;
+      drawMarioSprite(135 + offset, 145, false);
+      tft.setTextSize(2);
+      tft.setTextColor(MARIO_RED);
+      tft.setCursor(65 + offset, 155);  tft.print("<<");
+      tft.setCursor(225 + offset, 155); tft.print(">>");
+    }
+  }
+}
+
+void updateTimerBar() {
+  unsigned long elapsed = millis() - actionStartTime;
+  if (elapsed > actionDuration) elapsed = actionDuration;
+  int barWidth = map(actionDuration - elapsed, 0, actionDuration, 0, SCREEN_W - 60);
+  tft.fillRect(30 + barWidth, 210, (SCREEN_W - 60) - barWidth, 14, MARIO_SKY);
+  tft.fillRect(30, 210, barWidth, 14, MARIO_RED);
+  tft.drawRect(30, 210, SCREEN_W - 60, 14, MARIO_BLACK);
+}
+
+void drawSuccessSplash() {
+  tft.fillRect(40, 65, SCREEN_W - 80, 110, MARIO_COIN);
+  tft.drawRect(40, 65, SCREEN_W - 80, 110, MARIO_BLACK);
+  tft.setTextColor(MARIO_BLACK); tft.setTextSize(3);
+  tft.setCursor(115, 85); tft.print("NICE!");
+  drawMarioSprite(135, 120, true);
+}
+
+void handleLossTrigger(String reason) {
+  currentState = STATE_GAME_OVER;
+
+  tft.fillScreen(MARIO_RED);
+  
+  bool newRecord = false;
+  if (currentScore > highScore) {
+    highScore = currentScore;
+    EEPROM.write(0, highScore); 
+    EEPROM.commit();            
+    newRecord = true;
+  }
+
+  tft.setTextColor(MARIO_WHITE); tft.setTextSize(4);
+  tft.setCursor(55, 35); tft.print("GAME OVER");
+  tft.setTextSize(2); tft.setCursor(110, 85); tft.print(reason);
+  
+  tft.fillRect(40, 120, SCREEN_W - 80, 65, MARIO_BLACK);
+  tft.setCursor(65, 135); tft.setTextColor(MARIO_COIN);
+  tft.print("FINAL SCORE: "); tft.print(currentScore);
+
+  if (newRecord) {
+    tft.setCursor(85, 160);
+    tft.setTextColor(MARIO_WHITE);
+    tft.print("NEW HIGH SCORE!");
+  }
+
+  tft.setTextColor(MARIO_WHITE); tft.setCursor(60, 205); tft.print("TAP START TO RESET");
+}
+
+void handleVictory() {
+  currentState = STATE_GAME_OVER;
+
+  tft.fillScreen(MARIO_COIN);
+  tft.setTextColor(MARIO_BLACK); tft.setTextSize(4);
+  tft.setCursor(45, 60); tft.print("VICTORY!");
+  tft.setTextSize(2); tft.setCursor(45, 120); tft.print("YOU BEAT THE GAME!");
+  tft.setCursor(55, 190); tft.print("TAP START TO RESET");
+}
