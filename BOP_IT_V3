@@ -1,0 +1,426 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include "DFRobotDFPlayerMini.h"
+
+// ---- pins ----
+const int JOY_X_PIN      = 1;
+const int JOY_Y_PIN      = 2;
+const int JOY_CLICK_PIN  = 6;
+const int ACTION_BUTTON_PIN  = 4;
+const int NEWGAME_BUTTON_PIN = 5;
+const int I2C_SDA = 8;
+const int I2C_SCL = 9;
+const int LED_GREEN_PIN = 7;
+const int LED_RED_PIN   = 16;
+
+const int TFT_SCLK = 12;
+const int TFT_MOSI = 11;
+const int TFT_CS   = 10;
+const int TFT_DC   = 14;
+const int TFT_RST  = 21;
+const int TFT_BL   = 15;
+const int TFT_W = 240;
+const int TFT_H = 320;
+
+const int DFPLAYER_RX_PIN = 18; // ESP32 RX <- DFPlayer TX
+const int DFPLAYER_TX_PIN = 17; // ESP32 TX -> DFPlayer RX
+
+// ---- constants ----
+const unsigned long MAX_TIME_MS      = 5000;
+const unsigned long MIN_TIME_MS      = 1500;
+const unsigned long TIME_STEP_MS     = 40; // shrink per point
+const unsigned long ACTION_DELAY_MS  = 500;
+const unsigned long RELEASE_DELAY_MS = 500;
+const unsigned long HOLD_TIME_MS     = 5000; // long-press duration for debug skip
+const int DEBUG_START_SCORE          = 95;
+const int NUM_ACTIONS                = 3;
+const unsigned long LED_DURATION_MS  = 300;
+const float MOVEMENT_THRESHOLD       = 12.0;
+const int JOY_MOVE_THRESHOLD         = 800;
+
+// ---- color scheme: green background, black text ----
+#define BG_COLOR    ST77XX_GREEN
+#define TEXT_COLOR  ST77XX_BLACK
+
+enum ActionType { ACTION_SHAKE_IT = 1, ACTION_PUSH_IT = 2, ACTION_FLICK_IT = 3 };
+enum ResultType { CORRECT, INCORRECT, TIMEOUT };
+enum SoundType { SND_SUCCESS, SND_WIN, SND_LOSE, SND_SHAKE_IT_PROMPT, SND_PUSH_IT_PROMPT, SND_FLICK_IT_PROMPT };
+
+Adafruit_MPU6050 mpu;
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+HardwareSerial dfSerial(1);
+DFRobotDFPlayerMini dfPlayer;
+
+int joyCenterX = 2048;
+int joyCenterY = 2048;
+
+int score = 0;
+int lastScore = 0;
+bool gameOver = true;
+unsigned long roundTimeLimit = MAX_TIME_MS;
+
+// ---- layout ----
+const int SCORE_Y     = 15;
+const int INSTR_Y     = 100;
+const int BAR_Y        = 160;
+const int BAR_H        = 30;
+const int BAR_MARGIN   = 20;
+int lastBarFillW = -1;
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  initializePins();
+  initializeDisplay();
+  initializeSound();
+
+  score = 0;
+  lastScore = 0;
+  gameOver = true;
+  digitalWrite(LED_GREEN_PIN, LOW);
+  digitalWrite(LED_RED_PIN, LOW);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found");
+    while (true) {}
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  analogReadResolution(12);
+  joyCenterX = analogRead(JOY_X_PIN);
+  joyCenterY = analogRead(JOY_Y_PIN);
+
+  randomSeed(analogRead(JOY_X_PIN));
+}
+
+void loop() {
+  waitForNewGame(); // sets score to 0, or DEBUG_START_SCORE on long-press
+  digitalWrite(LED_GREEN_PIN, LOW);
+  digitalWrite(LED_RED_PIN, LOW);
+  update_display_Score(score);
+
+  gameOver = false;
+  ResultType finalResult = CORRECT;
+  bool won = false;
+
+  while (!gameOver) {
+    roundTimeLimit = computeTimeLimit(score);
+
+    int currentAction = random(1, NUM_ACTIONS + 1);
+    ResultType result;
+
+    if (currentAction == ACTION_SHAKE_IT) {
+      playSound(SND_SHAKE_IT_PROMPT);
+      drawInstructionScreen("SHAKE IT!");
+      result = checkAccelerometer();      // Shake It!
+    } else if (currentAction == ACTION_PUSH_IT) {
+      playSound(SND_PUSH_IT_PROMPT);
+      drawInstructionScreen("PUSH IT!");
+      result = checkPushButton();         // Push It!
+    } else {
+      playSound(SND_FLICK_IT_PROMPT);
+      drawInstructionScreen("FLICK IT!");
+      result = checkJoystick();           // Flick It!
+    }
+
+    delay(RELEASE_DELAY_MS); // let user release input before next action/screen
+
+    if (result == CORRECT) {
+      score++;
+      lightLED(LED_GREEN_PIN);
+      if (score >= 99) {
+        playSound(SND_WIN);
+        update_display_Score(score);
+        gameOver = true;
+        won = true;
+      } else {
+        playSound(SND_SUCCESS);
+        update_display_Score(score);
+        delay(ACTION_DELAY_MS);
+      }
+    } else {
+      lightLED(LED_RED_PIN);
+      playSound(SND_LOSE);
+      gameOver = true;
+      finalResult = result; // INCORRECT or TIMEOUT
+    }
+  }
+
+  lastScore = score;
+  showGameOverScreen(won, finalResult);
+}
+
+unsigned long computeTimeLimit(int currentScore) {
+  unsigned long shrink = (unsigned long)currentScore * TIME_STEP_MS;
+  if (shrink >= MAX_TIME_MS - MIN_TIME_MS) return MIN_TIME_MS;
+  return MAX_TIME_MS - shrink;
+}
+
+void drawHomeScreen() {
+  tft.fillScreen(BG_COLOR);
+  tft.setTextColor(TEXT_COLOR);
+
+  tft.setTextSize(4);
+  tft.setCursor(20, 50);
+  tft.println("GAME-IT");
+
+  tft.setTextSize(2);
+  tft.setCursor(20, 130);
+  tft.print("Last Score: ");
+  tft.print(lastScore);
+
+  tft.setTextSize(2);
+  tft.setCursor(20, 190);
+  tft.println("PRESS START");
+}
+
+void waitForNewGame() {
+  digitalWrite(LED_GREEN_PIN, LOW);
+  digitalWrite(LED_RED_PIN, LOW);
+
+  drawHomeScreen();
+
+  bool pressing = false;
+  unsigned long pressStart = 0;
+
+  while (true) {
+    bool pressed = (digitalRead(NEWGAME_BUTTON_PIN) == HIGH);
+
+    if (pressed && !pressing) {
+      pressing = true;
+      pressStart = millis();
+    } else if (!pressed && pressing) {
+      // released before hold threshold -- normal new game
+      score = 0;
+      return;
+    } else if (pressed && pressing) {
+      if (millis() - pressStart >= HOLD_TIME_MS) {
+        score = DEBUG_START_SCORE; // debug skip-ahead
+        while (digitalRead(NEWGAME_BUTTON_PIN) == HIGH) {} // wait for release
+        return;
+      }
+    }
+  }
+}
+
+void drawInstructionScreen(const char *instruction) {
+  tft.fillScreen(BG_COLOR);
+  tft.setTextColor(TEXT_COLOR);
+
+  tft.setTextSize(5);
+  tft.setCursor(20, SCORE_Y);
+  tft.print(score);
+
+  tft.setTextSize(3);
+  tft.setCursor(20, INSTR_Y);
+  tft.println(instruction);
+
+  lastBarFillW = -1; // force full bar redraw for new round
+  drawTimeRemaining(roundTimeLimit);
+}
+
+// Draws/updates the countdown loading bar, erasing only the shrinking sliver
+void drawTimeRemaining(unsigned long msRemaining) {
+  int barW = tft.width() - (2 * BAR_MARGIN);
+  int fillW = (int)((float)msRemaining / (float)roundTimeLimit * barW);
+  if (fillW < 0) fillW = 0;
+
+  if (lastBarFillW < 0 || fillW > lastBarFillW) {
+    tft.fillRect(BAR_MARGIN, BAR_Y, barW, BAR_H, BG_COLOR);
+    tft.drawRect(BAR_MARGIN, BAR_Y, barW, BAR_H, TEXT_COLOR);
+    tft.fillRect(BAR_MARGIN, BAR_Y, fillW, BAR_H, TEXT_COLOR);
+  } else if (fillW < lastBarFillW) {
+    tft.fillRect(BAR_MARGIN + fillW, BAR_Y, lastBarFillW - fillW, BAR_H, BG_COLOR);
+  }
+  lastBarFillW = fillW;
+}
+
+void showGameOverScreen(bool won, ResultType reason) {
+  tft.fillScreen(BG_COLOR);
+  tft.setTextColor(TEXT_COLOR);
+
+  tft.setTextSize(3);
+  tft.setCursor(10, 40);
+  tft.println("GAME OVER");
+
+  tft.setTextSize(2);
+  tft.setCursor(10, 90);
+  if (won) {
+    tft.println("YOU WIN!");
+  } else if (reason == TIMEOUT) {
+    tft.println("TIMEOUT");
+  } else {
+    tft.println("WRONG INPUT");
+  }
+
+  tft.setTextSize(2);
+  tft.setCursor(10, 150);
+  tft.println("YOUR SCORE");
+  tft.setTextSize(5);
+  tft.setCursor(10, 180);
+  tft.print(score);
+
+  tft.setTextSize(2);
+  tft.setCursor(10, 260);
+  tft.println("PRESS START");
+
+  while (digitalRead(NEWGAME_BUTTON_PIN) == HIGH) {} // clear any held press
+  while (digitalRead(NEWGAME_BUTTON_PIN) == LOW) {}  // wait for fresh press
+  while (digitalRead(NEWGAME_BUTTON_PIN) == HIGH) {} // wait for that press to release before returning
+}
+
+// Shake It! -- Accelerometer
+ResultType checkAccelerometer() {
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < roundTimeLimit) {
+    unsigned long elapsed = millis() - startTime;
+    unsigned long remaining = roundTimeLimit - elapsed;
+    drawTimeRemaining(remaining);
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    float mag = sqrt(a.acceleration.x * a.acceleration.x +
+                      a.acceleration.y * a.acceleration.y +
+                      a.acceleration.z * a.acceleration.z);
+    float deviation = fabs(mag - 9.8);
+
+    bool buttonPressed = (digitalRead(ACTION_BUTTON_PIN) == HIGH);
+    bool joystickMoved = joystickIsMoved();
+
+    if (deviation > MOVEMENT_THRESHOLD) {
+      return CORRECT;
+    } else if (buttonPressed || joystickMoved) {
+      return INCORRECT;
+    }
+  }
+  return TIMEOUT;
+}
+
+// Push It! -- Button
+ResultType checkPushButton() {
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < roundTimeLimit) {
+    unsigned long elapsed = millis() - startTime;
+    unsigned long remaining = roundTimeLimit - elapsed;
+    drawTimeRemaining(remaining);
+
+    bool buttonPressed = (digitalRead(ACTION_BUTTON_PIN) == HIGH);
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    float mag = sqrt(a.acceleration.x * a.acceleration.x +
+                      a.acceleration.y * a.acceleration.y +
+                      a.acceleration.z * a.acceleration.z);
+    float deviation = fabs(mag - 9.8);
+    bool joystickMoved = joystickIsMoved();
+
+    if (buttonPressed) {
+      return CORRECT;
+    } else if (deviation > MOVEMENT_THRESHOLD || joystickMoved) {
+      return INCORRECT;
+    }
+  }
+  return TIMEOUT;
+}
+
+// Flick It! -- Analog Stick
+ResultType checkJoystick() {
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < roundTimeLimit) {
+    unsigned long elapsed = millis() - startTime;
+    unsigned long remaining = roundTimeLimit - elapsed;
+    drawTimeRemaining(remaining);
+
+    bool joystickMoved = joystickIsMoved();
+    bool buttonPressed = (digitalRead(ACTION_BUTTON_PIN) == HIGH);
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    float mag = sqrt(a.acceleration.x * a.acceleration.x +
+                      a.acceleration.y * a.acceleration.y +
+                      a.acceleration.z * a.acceleration.z);
+    float deviation = fabs(mag - 9.8);
+
+    if (joystickMoved) {
+      return CORRECT;
+    } else if (buttonPressed || deviation > MOVEMENT_THRESHOLD) {
+      return INCORRECT;
+    }
+  }
+  return TIMEOUT;
+}
+
+bool joystickIsMoved() {
+  int joyX = analogRead(JOY_X_PIN);
+  int joyY = analogRead(JOY_Y_PIN);
+  int dx = joyX - joyCenterX;
+  int dy = joyY - joyCenterY;
+  int dist = abs(dx) > abs(dy) ? abs(dx) : abs(dy);
+  return dist >= JOY_MOVE_THRESHOLD;
+}
+
+void lightLED(int pin) {
+  if (pin == LED_GREEN_PIN) {
+    digitalWrite(LED_GREEN_PIN, HIGH);
+    delay(LED_DURATION_MS);
+    digitalWrite(LED_GREEN_PIN, LOW);
+  } else if (pin == LED_RED_PIN) {
+    digitalWrite(LED_RED_PIN, HIGH);
+  }
+}
+
+void update_display_Score(int currentScore) {
+  tft.fillScreen(BG_COLOR);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setTextSize(6);
+  tft.setCursor(20, 80);
+  tft.print(currentScore);
+}
+
+void playSound(SoundType type) {
+  switch (type) {
+    case SND_SHAKE_IT_PROMPT:  dfPlayer.play(1); break;
+    case SND_PUSH_IT_PROMPT:   dfPlayer.play(2); break;
+    case SND_FLICK_IT_PROMPT:  dfPlayer.play(3); break;
+    case SND_SUCCESS:          dfPlayer.play(4); break;
+    case SND_LOSE:              dfPlayer.play(5); break;
+    case SND_WIN:                dfPlayer.play(6); break;
+  }
+}
+
+void initializePins() {
+  pinMode(ACTION_BUTTON_PIN, INPUT);
+  pinMode(NEWGAME_BUTTON_PIN, INPUT);
+  pinMode(JOY_CLICK_PIN, INPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+}
+
+void initializeDisplay() {
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
+  tft.init(TFT_W, TFT_H);
+  tft.setRotation(1);
+  tft.fillScreen(BG_COLOR);
+}
+
+void initializeSound() {
+  dfSerial.begin(9600, SERIAL_8N1, DFPLAYER_RX_PIN, DFPLAYER_TX_PIN);
+  if (!dfPlayer.begin(dfSerial)) {
+    Serial.println("DFPlayer not found");
+  } else {
+    dfPlayer.volume(20);
+  }
+}
